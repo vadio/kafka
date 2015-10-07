@@ -16,13 +16,13 @@
 FROM ubuntu:14.04
 
 # Enable apt-proxy if present
-COPY .docker/apt-proxy* /tmp/apt-proxy
-RUN \
-  if [ -f "/tmp/apt-proxy" ]; then \
-    APT_PROXY=$(cat "/tmp/apt-proxy"); \
-    echo "Using apt-proxy: $APT_PROXY"; \
-    echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/90-apt-proxy.conf ; \
-  fi
+#COPY .docker/apt-proxy* /tmp/apt-proxy
+#RUN \
+#  if [ -f "/tmp/apt-proxy" ]; then \
+#    APT_PROXY=$(cat "/tmp/apt-proxy"); \
+#    echo "Using apt-proxy: $APT_PROXY"; \
+#    echo "Acquire::http::Proxy \"$APT_PROXY\";" > /etc/apt/apt.conf.d/90-apt-proxy.conf ; \
+#  fi
 
 # Add mesos repo
 RUN \
