@@ -46,7 +46,7 @@ dependencies {
 }
 
 jar {
-    dependsOn 'test'
+ //   dependsOn 'test'
     doFirst {
         from(configurations.compile.collect { it.isDirectory() ? it : zipTree(it) }) {
             exclude "*"
