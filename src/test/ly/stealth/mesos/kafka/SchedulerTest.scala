@@ -23,6 +23,8 @@ import org.junit.Assert._
 import org.apache.mesos.Protos.TaskState
 import java.util.Date
 
+import scala.util.parsing.json.JSONObject
+
 class SchedulerTest extends MesosTestCase {
   @Test
   def newExecutor {
@@ -48,7 +50,7 @@ class SchedulerTest extends MesosTestCase {
     broker.cpus = 0.5
     broker.mem = 256
 
-    val offer = this.offer(slaveId = "slave", hostname = "host", resources = s"cpus:${broker.cpus},mem:${broker.mem},ports:1000")
+    val offer = this.offer(slaveId = "slave", hostname = "host", resources = s"cpus:${broker.cpus}; mem:${broker.mem}; ports:1000")
     val reservation = broker.getReservation(offer)
 
     val task = Scheduler.newTask(broker, offer, reservation)
@@ -56,7 +58,7 @@ class SchedulerTest extends MesosTestCase {
     assertNotNull(task.getExecutor)
 
     // resources
-    assertEquals(resources(s"cpus:${broker.cpus}, mem:${broker.mem}, ports:1000"), task.getResourcesList)
+    assertEquals(resources(s"cpus:${broker.cpus}; mem:${broker.mem}; ports:1000"), task.getResourcesList)
 
     // data
     val data: util.Map[String, String] = Util.parseMap(task.getData.toStringUtf8)
@@ -77,7 +79,7 @@ class SchedulerTest extends MesosTestCase {
   @Test
   def syncBrokers {
     val broker = Scheduler.cluster.addBroker(new Broker())
-    val offer = this.offer(resources = s"cpus:${broker.cpus}, mem:${broker.mem}, ports:1000")
+    val offer = this.offer(resources = s"cpus:${broker.cpus}; mem:${broker.mem}; ports:1000")
 
     // broker !active
     Scheduler.syncBrokers(util.Arrays.asList(offer))
@@ -106,13 +108,13 @@ class SchedulerTest extends MesosTestCase {
     assertEquals("reconciling", Scheduler.acceptOffer(null))
 
     broker.task = null
-    assertEquals(s"broker ${broker.id}: cpus < ${broker.cpus}", Scheduler.acceptOffer(offer(resources = s"cpus:0.4, mem:${broker.mem}")))
-    assertEquals(s"broker ${broker.id}: mem < ${broker.mem}", Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}, mem:99")))
+    assertEquals(s"broker ${broker.id}: cpus < ${broker.cpus}", Scheduler.acceptOffer(offer(resources = s"cpus:0.4; mem:${broker.mem}")))
+    assertEquals(s"broker ${broker.id}: mem < ${broker.mem}", Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}; mem:99")))
 
-    assertNull(Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}, mem:${broker.mem}, ports:1000")))
+    assertNull(Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}; mem:${broker.mem}; ports:1000")))
     assertEquals(1, schedulerDriver.launchedTasks.size())
 
-    assertEquals("", Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}, mem:${broker.mem}")))
+    assertEquals("", Scheduler.acceptOffer(offer(resources = s"cpus:${broker.cpus}; mem:${broker.mem}")))
   }
 
   @Test
@@ -150,17 +152,21 @@ class SchedulerTest extends MesosTestCase {
 
     // finished
     broker.task = task
+    broker.needsRestart = true
     Scheduler.onBrokerStopped(broker, taskStatus(state = TaskState.TASK_FINISHED))
     assertNull(broker.task)
     assertEquals(0, broker.failover.failures)
+    assertFalse(broker.needsRestart)
 
     // failed
     broker.active = true
     broker.task = task
+    broker.needsRestart = true
     Scheduler.onBrokerStopped(broker, taskStatus(state = TaskState.TASK_FAILED), new Date(0))
     assertNull(broker.task)
     assertEquals(1, broker.failover.failures)
     assertEquals(new Date(0), broker.failover.failureTime)
+    assertFalse(broker.needsRestart)
 
     // failed maxRetries exceeded
     broker.failover.maxTries = 2
@@ -177,10 +183,12 @@ class SchedulerTest extends MesosTestCase {
   @Test
   def launchTask {
     val broker = Scheduler.cluster.addBroker(new Broker("100"))
-    val offer = this.offer(resources = s"cpus:${broker.cpus}, mem:${broker.mem}", attributes = "a=1,b=2")
+    val offer = this.offer(resources = s"cpus:${broker.cpus}; mem:${broker.mem}", attributes = "a=1,b=2")
+    broker.needsRestart = true
 
     Scheduler.launchTask(broker, offer)
     assertEquals(1, schedulerDriver.launchedTasks.size())
+    assertFalse(broker.needsRestart)
 
     assertNotNull(broker.task)
     assertEquals(Broker.State.STARTING, broker.task.state)
@@ -233,5 +241,98 @@ class SchedulerTest extends MesosTestCase {
     assertArrayEquals(Array[AnyRef]("host0", "host1"), Scheduler.otherTasksAttributes("hostname").asInstanceOf[Array[AnyRef]])
     assertArrayEquals(Array[AnyRef]("1"), Scheduler.otherTasksAttributes("a").asInstanceOf[Array[AnyRef]])
     assertArrayEquals(Array[AnyRef]("2", "3"), Scheduler.otherTasksAttributes("b").asInstanceOf[Array[AnyRef]])
+  }
+
+  @Test
+  def onFrameworkMessage = {
+    val broker0 = Scheduler.cluster.addBroker(new Broker("0"))
+    broker0.active = true
+    val broker1 = Scheduler.cluster.addBroker(new Broker("1"))
+    broker1.active = true
+
+    assertNull(broker0.metrics)
+    assertNull(broker1.metrics)
+
+    val metrics0 = new Broker.Metrics()
+    metrics0.underReplicatedPartitions = 2
+    metrics0.offlinePartitionsCount = 3
+    metrics0.activeControllerCount = 1
+    metrics0.timestamp = System.currentTimeMillis()
+
+    val data = scala.util.parsing.json.JSONObject(Map("metrics" -> metrics0.toJson)).toString().getBytes
+
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker0)), slaveId(), data)
+
+    // metrics updated for corresponding broker
+    assertNotNull(broker0.metrics)
+    assertNull(broker1.metrics)
+
+    def assertMetricsEquals(expected: Broker.Metrics, actual: Broker.Metrics): Unit = {
+      assertEquals(expected.underReplicatedPartitions, actual.underReplicatedPartitions)
+      assertEquals(expected.offlinePartitionsCount, actual.offlinePartitionsCount)
+      assertEquals(expected.activeControllerCount, actual.activeControllerCount)
+      assertEquals(expected.timestamp, actual.timestamp)
+    }
+
+    assertMetricsEquals(metrics0, broker0.metrics)
+
+    // metrics updated only for active brokers
+    broker1.active = false
+
+    val metrics1 = new Broker.Metrics()
+    metrics1.offlinePartitionsCount = 1
+    metrics1.timestamp = System.currentTimeMillis()
+
+    val data1 = scala.util.parsing.json.JSONObject(Map("metrics" -> metrics1.toJson)).toString().getBytes
+
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker1)), slaveId(), data1)
+
+    assertNull(broker1.metrics)
+  }
+
+  @Test
+  def sendReceiveBrokerLog = {
+    val broker = Scheduler.cluster.addBroker(new Broker("0"))
+    broker.task = new Broker.Task("task-id", "slave-id", "executor-id")
+
+    // driver connected
+    val requestId = Scheduler.requestBrokerLog(broker, "stdout", 111)
+    assertEquals(1, schedulerDriver.sentFrameworkMessages.size())
+    val message = schedulerDriver.sentFrameworkMessages.get(0)
+    assertEquals(broker.task.executorId, message._1.getValue)
+    assertEquals(broker.task.slaveId, message._2.getValue)
+    assertEquals(LogRequest(requestId, 111, "stdout").toString, message._3)
+
+    val content = "1\n2\n3\n"
+    val data = LogResponse(requestId, content).toJson.toString().getBytes
+
+    // skip log response when broker is null
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(new Broker("100"))), slaveId(), data)
+    assertEquals(None, Scheduler.logs.get(requestId))
+
+    // skip log response when not active
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker)), slaveId(), data)
+    assertEquals(None, Scheduler.logs.get(requestId))
+
+    // skip log response when no task
+    broker.active = true
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker)), slaveId(), data)
+    assertEquals(None, Scheduler.logs.get(requestId))
+
+    // skip log response when has task but no running
+    broker.task = new Broker.Task()
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker)), slaveId(), data)
+    assertEquals(None, Scheduler.logs.get(requestId))
+
+    // broker has to be and task has to be running
+    broker.task = new Broker.Task(_state = Broker.State.RUNNING)
+    Scheduler.frameworkMessage(schedulerDriver, executorId(Broker.nextExecutorId(broker)), slaveId(), data)
+    assertEquals(Some(content), Scheduler.logs.get(requestId))
+
+    // driver disconnected
+    Scheduler.disconnected(schedulerDriver)
+    val sizeBeforeRequest = Scheduler.logs.size()
+    assertEquals(-1L, Scheduler.requestBrokerLog(broker, "stdout", 1))
+    assertEquals(sizeBeforeRequest, Scheduler.logs.size())
   }
 }

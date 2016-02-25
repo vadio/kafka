@@ -17,6 +17,7 @@
 
 package ly.stealth.mesos.kafka
 
+import java.util.concurrent.ConcurrentHashMap
 import org.apache.log4j._
 import org.apache.mesos.Protos._
 import org.apache.mesos.{MesosSchedulerDriver, SchedulerDriver}
@@ -24,13 +25,15 @@ import java.util
 import com.google.protobuf.ByteString
 import java.util.{Collections, Date}
 import scala.collection.JavaConversions._
-import ly.stealth.mesos.kafka.Util.{Period, Str}
+import ly.stealth.mesos.kafka.Util.{Version, Period, Str}
 
 object Scheduler extends org.apache.mesos.Scheduler {
   private val logger: Logger = Logger.getLogger(this.getClass)
 
   val cluster: Cluster = new Cluster()
   private var driver: SchedulerDriver = null
+
+  val logs = new ConcurrentHashMap[Long, Option[String]]()
 
   private[kafka] def newExecutor(broker: Broker): ExecutorInfo = {
     var cmd = "java -cp " + HttpServer.jar.getName
@@ -47,7 +50,7 @@ object Scheduler extends org.apache.mesos.Scheduler {
     }
 
     commandBuilder
-      .addUris(CommandInfo.URI.newBuilder().setValue(Config.api + "/jar/" + HttpServer.jar.getName))
+      .addUris(CommandInfo.URI.newBuilder().setValue(Config.api + "/jar/" + HttpServer.jar.getName).setExtract(false))
       .addUris(CommandInfo.URI.newBuilder().setValue(Config.api + "/kafka/" + HttpServer.kafkaDist.getName))
       .setValue(cmd)
 
@@ -60,7 +63,7 @@ object Scheduler extends org.apache.mesos.Scheduler {
 
   private[kafka] def newTask(broker: Broker, offer: Offer, reservation: Broker.Reservation): TaskInfo = {
     def taskData: ByteString = {
-      val defaults: Map[String, String] = Map(
+      var defaults: Map[String, String] = Map(
         "broker.id" -> broker.id,
         "port" -> ("" + reservation.port),
         "log.dirs" -> "kafka-logs",
@@ -69,6 +72,12 @@ object Scheduler extends org.apache.mesos.Scheduler {
         "zookeeper.connect" -> Config.zk,
         "host.name" -> offer.getHostname
       )
+
+      if (HttpServer.kafkaVersion.compareTo(new Version("0.9")) >= 0)
+        defaults += ("listeners" -> s"PLAINTEXT://:${reservation.port}")
+
+      if (reservation.volume != null)
+        defaults += ("log.dirs" -> "data/kafka-logs")
 
       val data = new util.HashMap[String, String]()
       data.put("broker", "" + broker.toJson)
@@ -119,6 +128,33 @@ object Scheduler extends org.apache.mesos.Scheduler {
 
   def frameworkMessage(driver: SchedulerDriver, executorId: ExecutorID, slaveId: SlaveID, data: Array[Byte]): Unit = {
     logger.info("[frameworkMessage] executor:" + Str.id(executorId.getValue) + " slave:" + Str.id(slaveId.getValue) + " data: " + new String(data))
+
+    val broker = cluster.getBroker(Broker.idFromExecutorId(executorId.getValue))
+
+    try {
+      val node: Map[String, Object] = Util.parseJson(new String(data))
+      if (node.contains("metrics")) {
+        if (broker != null && broker.active) {
+          val metricsNode = node("metrics").asInstanceOf[Map[String, Object]]
+          val metrics = new Broker.Metrics()
+          metrics.fromJson(metricsNode)
+
+          broker.metrics = metrics
+        }
+      }
+
+      if (node.contains("log")) {
+        if (broker != null && broker.active && broker.task != null && broker.task.running) {
+          val logResponse = LogResponse.fromJson(node)
+          if (logs.containsKey(logResponse.requestId)) {
+            logs.put(logResponse.requestId, Some(logResponse.content))
+          }
+        }
+      }
+    } catch {
+      case e: IllegalArgumentException =>
+        logger.warn("Unable to parse framework message as JSON", e)
+    }
   }
 
   def disconnected(driver: SchedulerDriver): Unit = {
@@ -215,8 +251,12 @@ object Scheduler extends org.apache.mesos.Scheduler {
   }
 
   private[kafka] def onBrokerStopped(broker: Broker, status: TaskStatus, now: Date = new Date()): Unit = {
-    broker.task = null
+    if (broker == null) {
+      logger.info(s"Got ${status.getState} for unknown broker, ignoring it")
+      return
+    }
 
+    broker.task = null
     val failed = broker.active && status.getState != TaskState.TASK_FINISHED && status.getState != TaskState.TASK_KILLED
     broker.registerStop(now, failed)
 
@@ -235,11 +275,16 @@ object Scheduler extends org.apache.mesos.Scheduler {
 
       logger.info(msg)
     }
+
+    broker.metrics = null
+    broker.needsRestart = false
   }
 
   private def isReconciling: Boolean = cluster.getBrokers.exists(b => b.task != null && b.task.reconciling)
 
   private[kafka] def launchTask(broker: Broker, offer: Offer): Unit = {
+    broker.needsRestart = false
+
     val reservation = broker.getReservation(offer)
     val task_ = newTask(broker, offer, reservation)
     val id = task_.getTaskId.getValue
@@ -341,12 +386,12 @@ object Scheduler extends org.apache.mesos.Scheduler {
     frameworkBuilder.setCheckpoint(true)
 
     var credsBuilder: Credential.Builder = null
-    if (Config.principal != null) {
+    if (Config.principal != null && Config.secret != null) {
       frameworkBuilder.setPrincipal(Config.principal)
 
       credsBuilder = Credential.newBuilder()
       credsBuilder.setPrincipal(Config.principal)
-      if (Config.secret != null) credsBuilder.setSecret(ByteString.copyFromUtf8(Config.secret))
+      credsBuilder.setSecret(ByteString.copyFromUtf8(Config.secret))
     }
 
     val driver =
@@ -382,4 +427,23 @@ object Scheduler extends org.apache.mesos.Scheduler {
     
     root.addAppender(appender)
   }
+
+  def requestBrokerLog(broker: Broker, name: String, lines: Int): Long = {
+    var requestId: Long = -1
+    if (driver != null) {
+      requestId = System.currentTimeMillis()
+      logs.put(requestId, None)
+      val executorId = ExecutorID.newBuilder().setValue(broker.task.executorId).build()
+      val slaveId = SlaveID.newBuilder().setValue(broker.task.slaveId).build()
+
+      driver.sendFrameworkMessage(executorId, slaveId, LogRequest(requestId, lines, name).toString.getBytes)
+    }
+    requestId
+  }
+
+  def receivedLog(requestId: Long): Boolean = logs.get(requestId).isDefined
+
+  def logContent(requestId: Long): String = logs.get(requestId).get
+
+  def removeLog(requestId: Long): Option[String] = logs.remove(requestId)
 }

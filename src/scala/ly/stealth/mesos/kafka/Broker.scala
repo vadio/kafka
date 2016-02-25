@@ -18,11 +18,15 @@
 package ly.stealth.mesos.kafka
 
 import java.util
+import org.apache.mesos.Protos.Resource.{ReservationInfo, DiskInfo}
+import org.apache.mesos.Protos.Resource.DiskInfo.Persistence
+import org.apache.mesos.Protos.Volume.Mode
+
 import scala.collection.JavaConversions._
 import scala.collection
-import org.apache.mesos.Protos.{Value, Resource, Offer}
+import org.apache.mesos.Protos.{Volume, Value, Resource, Offer}
 import java.util._
-import ly.stealth.mesos.kafka.Broker.{Stickiness, Failover}
+import ly.stealth.mesos.kafka.Broker.{Metrics, Stickiness, Failover}
 import ly.stealth.mesos.kafka.Util.{BindAddress, Period, Range, Str}
 import java.text.SimpleDateFormat
 import scala.List
@@ -37,6 +41,7 @@ class Broker(_id: String = "0") {
   var mem: Long = 2048
   var heap: Long = 1024
   var port: Range = null
+  var volume: String = null
   var bindAddress: BindAddress = null
 
   var constraints: util.Map[String, Constraint] = new util.LinkedHashMap()
@@ -46,6 +51,11 @@ class Broker(_id: String = "0") {
 
   var stickiness: Stickiness = new Stickiness()
   var failover: Failover = new Failover()
+
+  var metrics: Metrics = null
+
+  // broker has been modified while being in non stopped state, once stopped or before task launch becomes false
+  var needsRestart: Boolean = false
 
   def options(defaults: util.Map[String, String] = null): util.Map[String, String] = {
     val result = new util.LinkedHashMap[String, String]()
@@ -82,6 +92,11 @@ class Broker(_id: String = "0") {
     for (attribute <- offer.getAttributesList)
       if (attribute.hasText) offerAttributes.put(attribute.getName, attribute.getText.getValue)
 
+    // check volume
+    if (volume != null && reservation.volume == null)
+      return s"offer missing volume: $volume"
+
+    // check constraints
     for ((name, constraint) <- constraints) {
       if (!offerAttributes.containsKey(name)) return s"no $name"
       if (!constraint.matches(offerAttributes.get(name), otherAttributes(name))) return s"$name doesn't match $constraint"
@@ -108,19 +123,34 @@ class Broker(_id: String = "0") {
 
     var role: String = null
 
+    var reservedVolume: String = null
+    var reservedVolumeSize: Double = 0
+    var reservedVolumePrincipal: String = null
+
     for (resource <- offer.getResourcesList) {
       if (resource.getRole == "*") {
+        // shared resources
         if (resource.getName == "cpus") sharedCpus = resource.getScalar.getValue
         if (resource.getName == "mem") sharedMem = resource.getScalar.getValue.toLong
         if (resource.getName == "ports") sharedPorts.addAll(resource.getRanges.getRangeList.map(r => new Range(r.getBegin.toInt, r.getEnd.toInt)))
       } else {
         if (role != null && role != resource.getRole)
           throw new IllegalArgumentException(s"Offer contains 2 non-default roles: $role, ${resource.getRole}")
-
         role = resource.getRole
-        if (resource.getName == "cpus") roleCpus = resource.getScalar.getValue
-        if (resource.getName == "mem") roleMem = resource.getScalar.getValue.toLong
-        if (resource.getName == "ports") rolePorts.addAll(resource.getRanges.getRangeList.map(r => new Range(r.getBegin.toInt, r.getEnd.toInt)))
+
+        // static role-reserved resources
+        if (!resource.hasReservation) {
+          if (resource.getName == "cpus") roleCpus = resource.getScalar.getValue
+          if (resource.getName == "mem") roleMem = resource.getScalar.getValue.toLong
+          if (resource.getName == "ports") rolePorts.addAll(resource.getRanges.getRangeList.map(r => new Range(r.getBegin.toInt, r.getEnd.toInt)))
+        }
+
+        // dynamic role/principal-reserved volume
+        if (volume != null && resource.hasDisk && resource.getDisk.hasPersistence && resource.getDisk.getPersistence.getId == volume) {
+          reservedVolume = volume
+          reservedVolumeSize = resource.getScalar.getValue
+          reservedVolumePrincipal = resource.getReservation.getPrincipal
+        }
       }
     }
 
@@ -134,7 +164,12 @@ class Broker(_id: String = "0") {
     if (reservedRolePort == -1)
       reservedSharedPort = getSuitablePort(sharedPorts)
 
-    new Broker.Reservation(role, reservedSharedCpus, reservedRoleCpus, reservedSharedMem, reservedRoleMem, reservedSharedPort, reservedRolePort)
+    new Broker.Reservation(role,
+      reservedSharedCpus, reservedRoleCpus,
+      reservedSharedMem, reservedRoleMem,
+      reservedSharedPort, reservedRolePort,
+      reservedVolume, reservedVolumeSize, reservedVolumePrincipal
+    )
   }
 
   private[kafka] def getSuitablePort(ports: util.List[Range]): Int = {
@@ -216,6 +251,7 @@ class Broker(_id: String = "0") {
     mem = node("mem").asInstanceOf[Number].longValue()
     heap = node("heap").asInstanceOf[Number].longValue()
     if (node.contains("port")) port = new Range(node("port").asInstanceOf[String])
+    if (node.contains("volume")) volume = node("volume").asInstanceOf[String]
     if (node.contains("bindAddress")) bindAddress = new BindAddress(node("bindAddress").asInstanceOf[String])
 
     if (node.contains("constraints")) constraints = Util.parseMap(node("constraints").asInstanceOf[String])
@@ -231,6 +267,13 @@ class Broker(_id: String = "0") {
       task = new Broker.Task()
       task.fromJson(node("task").asInstanceOf[Map[String, Object]])
     }
+
+    if (node.contains("metrics")) {
+      metrics = new Broker.Metrics()
+      metrics.fromJson(node("metrics").asInstanceOf[Map[String, Object]])
+    }
+
+    if (node.contains("needsRestart")) needsRestart = node("needsRestart").asInstanceOf[Boolean]
   }
 
   def toJson: JSONObject = {
@@ -242,6 +285,7 @@ class Broker(_id: String = "0") {
     obj("mem") = mem
     obj("heap") = heap
     if (port != null) obj("port") = "" + port
+    if (volume != null) obj("volume") = volume
     if (bindAddress != null) obj("bindAddress") = "" + bindAddress
 
     if (!constraints.isEmpty) obj("constraints") = Util.formatMap(constraints)
@@ -252,6 +296,8 @@ class Broker(_id: String = "0") {
     obj("stickiness") = stickiness.toJson
     obj("failover") = failover.toJson
     if (task != null) obj("task") = task.toJson
+    if (metrics != null) obj("metrics") = metrics.toJson
+    if (needsRestart) obj("needsRestart") = needsRestart
 
     new JSONObject(obj.toMap)
   }
@@ -266,6 +312,8 @@ object Broker {
     if (parts.length < 2) throw new IllegalArgumentException(taskId)
     parts(1)
   }
+
+  def idFromExecutorId(executorId: String): String = idFromTaskId(executorId)
 
   def isOptionOverridable(name: String): Boolean = !List("broker.id", "port", "zookeeper.connect").contains(name)
 
@@ -453,7 +501,8 @@ object Broker {
      _role: String = null,
      _sharedCpus: Double = 0.0, _roleCpus: Double = 0.0,
      _sharedMem: Long = 0, _roleMem: Long = 0,
-     _sharedPort: Long = -1, _rolePort: Long = -1
+     _sharedPort: Long = -1, _rolePort: Long = -1,
+     _volume: String = null, _volumeSize: Double = 0.0, _volumePrincipal: String = null
   ) {
     val role: String = _role
 
@@ -469,14 +518,59 @@ object Broker {
     val rolePort: Long = _rolePort
     def port: Long = if (rolePort != -1) rolePort else sharedPort
 
-    def toResources: util.List[Resource] = {
-      def cpus(value: Double, role: String): Resource = Resource.newBuilder.setName("cpus").setType(Value.Type.SCALAR).setScalar(Value.Scalar.newBuilder.setValue(value)).setRole(role).build()
-      def mem(value: Long, role: String): Resource = Resource.newBuilder.setName("mem").setType(Value.Type.SCALAR).setScalar(Value.Scalar.newBuilder.setValue(value)).setRole(role).build()
-      def port(value: Long, role: String): Resource =
-        Resource.newBuilder.setName("ports").setType(Value.Type.RANGES).setRanges(
-          Value.Ranges.newBuilder.addRange(Value.Range.newBuilder().setBegin(value).setEnd(value))
-        ).setRole(role).build()
+    val volume: String = _volume
+    val volumeSize: Double = _volumeSize
+    val volumePrincipal: String = _volumePrincipal
 
+    def toResources: util.List[Resource] = {
+      def cpus(value: Double, role: String): Resource = {
+        Resource.newBuilder
+          .setName("cpus")
+          .setType(Value.Type.SCALAR)
+          .setScalar(Value.Scalar.newBuilder.setValue(value))
+          .setRole(role)
+          .build()
+      }
+      
+      def mem(value: Long, role: String): Resource = {
+        Resource.newBuilder
+          .setName("mem")
+          .setType(Value.Type.SCALAR)
+          .setScalar(Value.Scalar.newBuilder.setValue(value))
+          .setRole(role)
+          .build()
+      }
+      
+      def port(value: Long, role: String): Resource = {
+        Resource.newBuilder
+            .setName("ports")
+            .setType(Value.Type.RANGES)
+            .setRanges(Value.Ranges.newBuilder.addRange(Value.Range.newBuilder().setBegin(value).setEnd(value)))
+            .setRole(role)
+            .build()
+      }
+
+      def volumeDisk(id: String, value: Double, role: String, principal: String): Resource = {
+        val volume = Volume.newBuilder.setMode(Mode.RW).setContainerPath("data").build()
+        val persistence = Persistence.newBuilder.setId(id).build()
+        
+        val disk = DiskInfo.newBuilder
+          .setPersistence(persistence)
+          .setVolume(volume)
+          .build()
+
+        val reservation = ReservationInfo.newBuilder.setPrincipal(principal).build()
+        
+        Resource.newBuilder
+          .setName("disk")
+          .setType(Value.Type.SCALAR)
+          .setScalar(Value.Scalar.newBuilder.setValue(value))
+          .setRole(role)
+          .setDisk(disk)
+          .setReservation(reservation)
+          .build()
+      }
+      
       val resources: util.List[Resource] = new util.ArrayList[Resource]()
 
       if (sharedCpus > 0) resources.add(cpus(sharedCpus, "*"))
@@ -488,7 +582,36 @@ object Broker {
       if (sharedPort != -1) resources.add(port(sharedPort, "*"))
       if (rolePort != -1) resources.add(port(rolePort, role))
 
+      if (volume != null) resources.add(volumeDisk(volume, volumeSize, role, volumePrincipal))
       resources
+    }
+  }
+
+  class Metrics {
+    var underReplicatedPartitions: Int = 0
+    var offlinePartitionsCount: Int = 0
+    var activeControllerCount: Int = 0
+
+    var timestamp: Long = 0
+
+    def fromJson(node: Map[String, Object]): Unit = {
+      underReplicatedPartitions = node("underReplicatedPartitions").asInstanceOf[Number].intValue()
+      offlinePartitionsCount = node("offlinePartitionsCount").asInstanceOf[Number].intValue()
+      activeControllerCount = node("activeControllerCount").asInstanceOf[Number].intValue()
+
+      timestamp = node("timestamp").asInstanceOf[Number].longValue()
+    }
+
+    def toJson: JSONObject = {
+      val obj = new collection.mutable.LinkedHashMap[String, Any]()
+
+      obj("underReplicatedPartitions") = underReplicatedPartitions
+      obj("offlinePartitionsCount") = offlinePartitionsCount
+      obj("activeControllerCount") = activeControllerCount
+
+      obj("timestamp") = timestamp
+
+      new JSONObject(obj.toMap)
     }
   }
 
